@@ -5,7 +5,7 @@
 #   - sudo installed, user added to sudo group
 #   - NetworkManager (nmtui) + wifi firmware, network status in bar
 #   - zram swap (zstd, 50% RAM)
-#   - quiet boot (hidden GRUB, loglevel=3)
+#   - quiet boot (hidden GRUB, loglevel=3, boot output on tty2)
 #   - dwm 6.8 + fullgaps, st 0.9.2, dmenu 5.4, slstatus 1.1
 #   - Tokyo Night theme, JetBrainsMono Nerd Font, stock keybinds
 #   - volume keys (amixer), battery/volume/time in bar
@@ -32,6 +32,7 @@ DWM_VER=6.8
 ST_VER=0.9.2
 DMENU_VER=5.4
 SLSTATUS_VER=1.1
+SLOCK_VER=1.7
 
 fetch_src() {  # fetch_src <url> <name> <ver>
     cd "$SRC"
@@ -49,6 +50,7 @@ apt update
 apt install -y \
     xserver-xorg xserver-xorg-video-all xinit x11-xserver-utils \
     build-essential libx11-dev libxft-dev libxinerama-dev libfreetype6-dev \
+    libxrandr-dev libxext-dev libimlib2-dev \
     fontconfig git wget unzip python3 \
     alsa-utils sudo network-manager zram-tools
 
@@ -117,6 +119,8 @@ Alt+P                   dmenu (launcher)
 Alt+Shift+Enter         terminal (st)
 Alt+Shift+C             close window
 Alt+Shift+Q             restart dwm
+Alt+Shift+L             lock screen
+Alt+Shift+E             log out (back to greeter)
 Alt+J / Alt+K           focus next / prev window
 Alt+Enter               swap focused window into master
 Alt+H / Alt+L           shrink / grow master area
@@ -252,6 +256,9 @@ static const Key keys[] = {
 	TAGKEYS(                        XK_8,                      7)
 	TAGKEYS(                        XK_9,                      8)
 	{ MODKEY|ShiftMask,             XK_q,      quit,           {0} },
+	/* lock / logout */
+	{ MODKEY|ShiftMask,             XK_l,      spawn,          SHCMD("slock") },
+	{ MODKEY|ShiftMask,             XK_e,      spawn,          SHCMD("pkill -x Xorg") },
 	/* keybind cheatsheet */
 	{ MODKEY,                       XK_F1,     spawn,          SHCMD("dmenu -l 40 -p keys < /usr/local/share/dwm-keys.txt") },
 	/* media keys */
@@ -371,16 +378,50 @@ PYEOF
 make clean install
 
 # ------------------------------------------------------------
+echo "==> Building slock $SLOCK_VER (+ blurred desktop & dwm logo, if patch applies)"
+fetch_src "https://dl.suckless.org/tools/slock-$SLOCK_VER.tar.gz" slock "$SLOCK_VER"
+
+wget -q https://tools.suckless.org/slock/patches/foreground-and-background/slock-foreground-and-background-20210611-35633d4.diff -O fg-bg.diff
+if patch -p1 --dry-run < fg-bg.diff >/dev/null 2>&1; then
+    patch -p1 < fg-bg.diff
+    echo "    foreground-and-background patch applied"
+else
+    echo "    WARN: patch doesn't apply to slock $SLOCK_VER, building plain slock"
+fi
+rm -f fg-bg.diff
+
+cp config.def.h config.h
+python3 - << 'PYEOF'
+import re
+with open('config.h') as f:
+    c = f.read()
+# logo idle = dim, typing = accent, wrong = red (plain slock: whole screen)
+c = re.sub(r'\[INIT\]\s*=\s*"[^"]*"',   '[INIT] =   "#565f89"', c)
+c = re.sub(r'\[INPUT\]\s*=\s*"[^"]*"',  '[INPUT] =  "#7aa2f7"', c)
+c = re.sub(r'\[FAILED\]\s*=\s*"[^"]*"', '[FAILED] = "#f7768e"', c)
+c = re.sub(r'logosize\s*=\s*\d+', 'logosize = 40', c)
+c = re.sub(r'blurRadius\s*=\s*\d+', 'blurRadius=10', c)
+with open('config.h', 'w') as f:
+    f.write(c)
+PYEOF
+make clean install
+
+# ------------------------------------------------------------
 echo "==> Quiet boot + Tokyo Night console palette"
 # 16-color VT palette (same colors as st), applies to tty + tuigreet
 VT_RED="26,247,158,224,122,187,125,169,65,247,158,224,122,187,125,192"
 VT_GRN="27,118,206,175,162,154,207,177,72,118,206,175,162,154,207,202"
 VT_BLU="38,142,106,104,247,247,255,214,104,142,106,104,247,247,255,245"
-CMDLINE="quiet loglevel=3 vt.default_red=$VT_RED vt.default_grn=$VT_GRN vt.default_blu=$VT_BLU"
+CMDLINE="quiet console=tty2 loglevel=3 vt.default_red=$VT_RED vt.default_grn=$VT_GRN vt.default_blu=$VT_BLU"
 sed -i \
     -e 's/^#\?GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' \
     -e "s/^#\\?GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"$CMDLINE\"/" \
     /etc/default/grub
+# drop "Loading Linux ..." / "Loading initial ramdisk ..." lines
+sed -i '/echo.*\$message.*grub_quote/d' /etc/grub.d/10_linux
+# initramfs with only modules this machine needs -> smaller, loads faster
+# (rebuilt by update-initramfs further down)
+sed -i 's/^MODULES=.*/MODULES=dep/' /etc/initramfs-tools/initramfs.conf
 grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
     && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
     || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
@@ -443,6 +484,12 @@ user = "$GREETER_USER"
 EOF
 systemctl daemon-reload
 systemctl enable greetd
+
+# ------------------------------------------------------------
+echo "==> Trimming boot services"
+apt purge -y modemmanager || true
+systemctl mask systemd-binfmt.service
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
 
 # ------------------------------------------------------------
 echo "==> Unmuting audio (no-op if there's no sound card)"
