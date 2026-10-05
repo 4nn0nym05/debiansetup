@@ -11,21 +11,25 @@
 #   - volume keys (amixer), battery/volume/time in bar
 #   - Hyper-V modesetting fix (auto-detected, skipped on real HW)
 #
-# Usage (as root):  ./setup-suckless.sh <username>
+# Usage (as root):  ./setup.sh <username>
+#                   ISO_BUILD=1 ./setup.sh   (live-build chroot, see iso/)
 # ============================================================
 set -euo pipefail
 
+ISO_BUILD="${ISO_BUILD:-0}"
 TARGET_USER="${1:-}"
-if [[ -z "$TARGET_USER" ]]; then
-    echo "Usage: $0 <username>"; exit 1
-fi
 if [[ $EUID -ne 0 ]]; then
     echo "Run as root."; exit 1
 fi
-if ! id "$TARGET_USER" &>/dev/null; then
-    echo "User '$TARGET_USER' does not exist."; exit 1
+if [[ $ISO_BUILD != 1 ]]; then
+    if [[ -z "$TARGET_USER" ]]; then
+        echo "Usage: $0 <username>"; exit 1
+    fi
+    if ! id "$TARGET_USER" &>/dev/null; then
+        echo "User '$TARGET_USER' does not exist."; exit 1
+    fi
+    USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 fi
-USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 
 SRC=/usr/local/src
 DWM_VER=6.8
@@ -52,13 +56,16 @@ apt install -y \
     build-essential libx11-dev libxft-dev libxinerama-dev libfreetype6-dev \
     libxrandr-dev libxext-dev libimlib2-dev \
     fontconfig git wget unzip python3 \
-    alsa-utils sudo network-manager zram-tools
+    alsa-utils brightnessctl xss-lock sudo network-manager wpasupplicant rfkill zram-tools
 
-echo "==> Adding $TARGET_USER to sudo + netdev groups"
-usermod -aG sudo,netdev "$TARGET_USER"
+if [[ $ISO_BUILD != 1 ]]; then   # ISO: groups come from Calamares users.conf
+    echo "==> Adding $TARGET_USER to sudo + netdev groups"
+    usermod -aG sudo,netdev "$TARGET_USER"
+fi
 
 # GPU (Intel/AMD) + wifi firmware (Intel/Realtek/Atheros) — needs non-free-firmware in sources
 apt install -y firmware-misc-nonfree firmware-amd-graphics firmware-iwlwifi firmware-realtek firmware-atheros \
+    firmware-sof-signed intel-microcode amd64-microcode \
     || echo "    WARN: firmware not available (non-free-firmware repo not enabled?)"
 
 # NetworkManager ignores anything in /etc/network/interfaces, so strip it
@@ -85,6 +92,17 @@ nmcli -t -f TYPE,STATE,CONNECTION device 2>/dev/null | awk -F: '
 EOF
 chmod +x /usr/local/bin/bar-net
 
+# bar helper: "bat NN% | " if a battery exists, empty otherwise
+# (runtime check -> same build works on VM, desktop and laptop)
+cat > /usr/local/bin/bar-bat << 'EOF'
+#!/bin/sh
+for b in /sys/class/power_supply/BAT*; do
+    [ -r "$b/capacity" ] && { echo "bat $(cat "$b/capacity")% | "; exit; }
+done
+echo
+EOF
+chmod +x /usr/local/bin/bar-bat
+
 # ------------------------------------------------------------
 echo "==> Configuring zram swap (zstd, 50% of RAM)"
 cat > /etc/default/zramswap << 'EOF'
@@ -96,9 +114,11 @@ cat > /etc/sysctl.d/99-zram.conf << 'EOF'
 vm.swappiness=100
 vm.page-cluster=0
 EOF
-sysctl -q --system
 systemctl enable zramswap
-systemctl restart zramswap
+if [[ $ISO_BUILD != 1 ]]; then
+    sysctl -q --system
+    systemctl restart zramswap
+fi
 
 # ------------------------------------------------------------
 echo "==> Installing JetBrainsMono Nerd Font (system-wide)"
@@ -144,6 +164,7 @@ Alt+LMB drag            move window
 Alt+RMB drag            resize window
 Alt+MMB                 toggle floating
 Vol+ / Vol- / Mute      volume
+Bright+ / Bright-       backlight
 st: Ctrl+Shift+C / V    copy / paste
 st: Shift+Insert        paste primary selection
 st: Ctrl+Shift+PgUp/Dn  font size + / -
@@ -265,6 +286,8 @@ static const Key keys[] = {
 	{ 0, XF86XK_AudioRaiseVolume, spawn, SHCMD("amixer set Master 5%+") },
 	{ 0, XF86XK_AudioLowerVolume, spawn, SHCMD("amixer set Master 5%-") },
 	{ 0, XF86XK_AudioMute,        spawn, SHCMD("amixer set Master toggle") },
+	{ 0, XF86XK_MonBrightnessUp,   spawn, SHCMD("brightnessctl -q set 5%+") },
+	{ 0, XF86XK_MonBrightnessDown, spawn, SHCMD("brightnessctl -q -n set 5%-") },
 };
 
 static const Button buttons[] = {
@@ -347,25 +370,17 @@ echo "==> Building slstatus $SLSTATUS_VER"
 fetch_src "https://dl.suckless.org/tools/slstatus-$SLSTATUS_VER.tar.gz" slstatus "$SLSTATUS_VER"
 cp config.def.h config.h
 
-BAT=$(ls /sys/class/power_supply/ 2>/dev/null | grep -m1 '^BAT' || true)
-if [[ -n "$BAT" ]]; then
-    echo "    battery found: $BAT"
-    BAT_LINE="	{ battery_perc,     \"bat %s%% | \",  \"$BAT\" },"
-else
-    echo "    no battery (VM/desktop), skipping battery module"
-    BAT_LINE=""
-fi
+# helper prints nothing without a battery -> show nothing instead of "n/a"
+sed -i 's|^static const char unknown_str\[\] = .*;|static const char unknown_str[] = "";|' config.h
 
-python3 - "$BAT_LINE" << 'PYEOF'
-import re, sys
-bat_line = sys.argv[1]
+python3 - << 'PYEOF'
+import re
 with open('config.h') as f:
     content = f.read()
 
 args = "static const struct arg args[] = {\n\t/* function        format          argument */\n"
 args += "\t{ run_command,      \"%s | \",      \"bar-net\" },\n"
-if bat_line:
-    args += bat_line + "\n"
+args += "\t{ run_command,      \"%s\",           \"bar-bat\" },\n"
 args += "\t{ run_command,      \"vol %s%% | \",  \"amixer sget Master 2>/dev/null | grep -o '[0-9]*%' | head -1 | tr -d %\" },\n"
 args += "\t{ datetime,         \"%s\",           \"%a %d %b %H:%M\" },\n};"
 
@@ -421,15 +436,19 @@ sed -i \
 sed -i '/echo.*\$message.*grub_quote/d' /etc/grub.d/10_linux
 # initramfs with only modules this machine needs -> smaller, loads faster
 # (rebuilt by update-initramfs further down)
-sed -i 's/^MODULES=.*/MODULES=dep/' /etc/initramfs-tools/initramfs.conf
+# ISO: stays MODULES=most, the image must boot on hardware it wasn't built on
+[[ $ISO_BUILD == 1 ]] || sed -i 's/^MODULES=.*/MODULES=dep/' /etc/initramfs-tools/initramfs.conf
 grep -q '^GRUB_TIMEOUT_STYLE=' /etc/default/grub \
     && sed -i 's/^GRUB_TIMEOUT_STYLE=.*/GRUB_TIMEOUT_STYLE=hidden/' /etc/default/grub \
     || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
-update-grub
+[[ $ISO_BUILD == 1 ]] || update-grub   # ISO: Calamares runs grub-mkconfig on the target
 
 # ------------------------------------------------------------
-echo "==> Checking for Hyper-V framebuffer quirk"
-if lsmod | grep -q hyperv_drm && [[ -e /dev/dri/card0 ]]; then
+echo "==> Writing /usr/local/sbin/hwsetup (hardware-specific tweaks)"
+# runs on the real machine: below (normal install) or from Calamares (ISO install)
+cat > /usr/local/sbin/hwsetup << 'HWEOF'
+#!/bin/sh
+if lsmod | grep -q hyperv_drm && [ -e /dev/dri/card0 ]; then
     echo "    Hyper-V detected, forcing modesetting driver"
     mkdir -p /etc/X11/xorg.conf.d
     cat > /etc/X11/xorg.conf.d/20-modesetting.conf << 'EOF'
@@ -442,21 +461,43 @@ EOF
 else
     echo "    not Hyper-V, skipping"
 fi
+HWEOF
+chmod +x /usr/local/sbin/hwsetup
+[[ $ISO_BUILD == 1 ]] || /usr/local/sbin/hwsetup
 
 # ------------------------------------------------------------
-echo "==> Writing $USER_HOME/.xinitrc"
-cat > "$USER_HOME/.xinitrc" << 'EOF'
+echo "==> Writing .xinitrc (/etc/skel + user)"
+# dwm session as a script + .desktop, so greetd/tuigreet lists it next to
+# any other WM/DE installed later (F3 in the greeter)
+cat > /usr/local/bin/dwm-session << 'EOF'
+#!/bin/sh
+xss-lock -- slock &
 slstatus &
 while true; do dwm; done
 EOF
-chown "$TARGET_USER":"$TARGET_USER" "$USER_HOME/.xinitrc"
+chmod +x /usr/local/bin/dwm-session
+mkdir -p /usr/share/xsessions
+cat > /usr/share/xsessions/dwm.desktop << 'EOF'
+[Desktop Entry]
+Name=dwm
+Comment=dynamic window manager
+Exec=/usr/local/bin/dwm-session
+Type=Application
+EOF
+
+cat > /etc/skel/.xinitrc << 'EOF'
+exec dwm-session
+EOF
+if [[ $ISO_BUILD != 1 ]]; then
+    install -m644 -o "$TARGET_USER" -g "$TARGET_USER" /etc/skel/.xinitrc "$USER_HOME/.xinitrc"
+fi
 
 # no autologin — remove override if a previous run created it
 rm -f /etc/systemd/system/getty@tty1.service.d/autologin.conf
 rmdir /etc/systemd/system/getty@tty1.service.d 2>/dev/null || true
 
 # old startx-on-tty1 hook from previous runs — greetd handles this now
-PROFILE="$USER_HOME/.bash_profile"
+PROFILE="${USER_HOME:-/nonexistent}/.bash_profile"
 if [[ -f "$PROFILE" ]]; then
     sed -i '/^if \[ -z "\$DISPLAY" \] && \[ "\$(tty)" = "\/dev\/tty1" \]; then$/,/^fi$/d' "$PROFILE"
 fi
@@ -479,7 +520,7 @@ cat > /etc/greetd/config.toml << EOF
 vt = 7
 
 [default_session]
-command = "tuigreet --time --remember --asterisks --width 50 --theme 'border=blue;title=blue;text=white;prompt=blue;input=white;time=gray;action=gray;button=blue;container=black' --cmd startx"
+command = "tuigreet --time --remember --remember-session --asterisks --width 50 --theme 'border=blue;title=blue;text=white;prompt=blue;input=white;time=gray;action=gray;button=blue;container=black' --cmd startx"
 user = "$GREETER_USER"
 EOF
 systemctl daemon-reload
